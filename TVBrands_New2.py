@@ -367,7 +367,6 @@ def run_perplexity_deep_research(brand, segment):
     return combined_answer.strip()    
 
 
-
 # ================== LLM-POWERED EXTRACTION OF FEATURES ==================
 def extract_competitive_insights(brand, sentences):
     """Refined to specifically target Boot-up Speed and UI performance."""
@@ -466,10 +465,20 @@ You are a senior strategy consultant for an Indian consumer electronics brand (2
 Brand: Lumio
 
 Observed signals:
-- Chat GPT Visibility gap vs competitors: {diagnostics["serp_visibility_gap"]:.2f}
-- Chat GPT Sentiment gap vs competitors: {diagnostics["serp_sentiment_gap"]:.2f}
-- Perplexity Visibility gap vs competitors: {diagnostics["pplx_visibility_gap"]:.2f}
-- Perplexity Sentiment gap vs competitors: {diagnostics["pplx_sentiment_gap"]:.2f}
+
+SERP + ChatGPT:
+- Visibility status: { "Not visible at all" if diagnostics["serp_visibility_status"]=="not_visible" else "Visible" }
+- Visibility gap vs competitors: {diagnostics["serp_visibility_gap"]}
+- Sentiment status: { "Sentiment not found due to low visibility" if diagnostics["serp_sentiment_status"]=="not_available" else "Available" }
+- Sentiment gap vs competitors: {diagnostics["serp_sentiment_gap"]}
+
+Perplexity:
+- Visibility status: { "Not visible at all" if diagnostics["pplx_visibility_status"]=="not_visible" else "Visible" }
+- Visibility gap vs competitors: {diagnostics["pplx_visibility_gap"]}
+- Sentiment status: { "Sentiment not found due to low visibility" if diagnostics["pplx_sentiment_status"]=="not_available" else "Available" }
+- Sentiment gap vs competitors: {diagnostics["pplx_sentiment_gap"]}
+
+
 - Top competing brands: {", ".join(diagnostics["top_competitors"])}
 
 User sentiment excerpts:
@@ -511,6 +520,59 @@ TRUST & SERVICE:
     )
 
     return response.choices[0].message.content
+
+
+def extract_perplex_competitive_insights_from_text(brand, context_text):
+    headers = {
+        "Authorization": f"Bearer {PERPLEXITY_API_KEY}",
+        "Content-Type": "application/json"
+    }
+
+    prompt = f"""
+You are a market research analyst.
+
+Using ONLY the information below, analyze the TV brand "{brand}" in India (2026).
+
+Context:
+{context_text[:4000]}
+
+Return STRICT JSON with EXACTLY these keys:
+{EXPANDED_FEATURES}
+
+Rules:
+- Values must be one of: "Excellent", "Good", "Average", "Poor", "Unknown"
+- Do NOT add extra keys
+- Do NOT add explanations
+- Do NOT return text outside JSON
+- Base ratings ONLY on the provided context
+"""
+
+    payload = {
+        "model": "sonar",
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0,
+        "return_citations": False
+    }
+
+    try:
+        r = requests.post(
+            "https://api.perplexity.ai/chat/completions",
+            headers=headers,
+            json=payload,
+            timeout=40
+        )
+
+        data = r.json()
+        parsed = json.loads(data["choices"][0]["message"]["content"])
+
+        if set(parsed.keys()) != set(EXPANDED_FEATURES):
+            raise ValueError("Schema mismatch")
+
+        return parsed
+
+    except Exception:
+        return {f: "N/A" for f in EXPANDED_FEATURES}
+
 
 # ================== UPDATED ANALYSIS LOOP ==================
 def run_analysis(queries):
@@ -708,31 +770,50 @@ def build_lumio_diagnostics(res):
 
     diagnostics = {}
 
-    # Visibility gap
-    diagnostics["serp_visibility_gap"] = (
-        competitors_serp["Visibility"].mean() - lumio_serp["Visibility"].values[0]
-        if not lumio_serp.empty and not competitors_serp.empty
-        else 0
-    )
+    # --- SERP VISIBILITY ---
+    if lumio_serp.empty and not competitors_serp.empty:
+        diagnostics["serp_visibility_gap"] = None
+        diagnostics["serp_visibility_status"] = "not_visible"
+    else:
+        diagnostics["serp_visibility_gap"] = (
+            competitors_serp["Visibility"].mean() - lumio_serp["Visibility"].values[0]
+            if not lumio_serp.empty and not competitors_serp.empty
+            else 0
+        )
+        diagnostics["serp_visibility_status"] = "visible"
     
-    diagnostics["pplx_visibility_gap"] = (
-        competitors_pplx["Visibility"].mean() - lumio_pplx["Visibility"].values[0]
-        if not lumio_pplx.empty and not competitors_pplx.empty
-        else 0
-    )
+    # --- PERPLEXITY VISIBILITY ---
+    if lumio_pplx.empty and not competitors_pplx.empty:
+        diagnostics["pplx_visibility_gap"] = None
+        diagnostics["pplx_visibility_status"] = "not_visible"
+    else:
+        diagnostics["pplx_visibility_gap"] = (
+            competitors_pplx["Visibility"].mean() - lumio_pplx["Visibility"].values[0]
+            if not lumio_pplx.empty and not competitors_pplx.empty
+            else 0
+        )
+        diagnostics["pplx_visibility_status"] = "visible"
 
-    # Sentiment gap
-    diagnostics["serp_sentiment_gap"] = (
-        competitors_serp["Sentiment"].mean() - lumio_serp["Sentiment"].values[0]
-        if not lumio_serp.empty and not competitors_serp.empty
-        else 0
-    )
+    # --- SERP SENTIMENT ---
+    if lumio_serp.empty or not res["serp"].get("Lumio", {}).get("sentences"):
+        diagnostics["serp_sentiment_gap"] = None
+        diagnostics["serp_sentiment_status"] = "not_available"
+    else:
+        diagnostics["serp_sentiment_gap"] = (
+            competitors_serp["Sentiment"].mean() - lumio_serp["Sentiment"].values[0]
+        )
+        diagnostics["serp_sentiment_status"] = "available"
     
-    diagnostics["pplx_sentiment_gap"] = (
-        competitors_pplx["Sentiment"].mean() - lumio_pplx["Sentiment"].values[0]
-        if not lumio_pplx.empty and not competitors_pplx.empty
-        else 0
-    )
+    
+    # --- PERPLEXITY SENTIMENT ---
+    if lumio_pplx.empty or not res["perplexity"].get("Lumio", {}).get("sentences"):
+        diagnostics["pplx_sentiment_gap"] = None
+        diagnostics["pplx_sentiment_status"] = "not_available"
+    else:
+        diagnostics["pplx_sentiment_gap"] = (
+            competitors_pplx["Sentiment"].mean() - lumio_pplx["Sentiment"].values[0]
+        )
+        diagnostics["pplx_sentiment_status"] = "available"
 
     # Weak sentiment words (SERP + Perplexity)
     lumio_sentences = (
@@ -819,6 +900,106 @@ def color_status(val):
     elif val == "Unknown" or val == "N/A":
         return "background-color: #f0f0f0"   # grey
     return ""
+
+def render_tab6_lumio_recommendations(res):
+    st.header("🎯 Strategic Recommendations for Lumio")
+    st.caption(
+        "Derived from market visibility (SERP + ChatGPT), expert consensus (Perplexity), "
+        "and comparative sentiment signals."
+    )
+
+    diagnostics = build_lumio_diagnostics(res)
+
+    # -------------------------------
+    # VISIBILITY & SENTIMENT METRICS
+    # -------------------------------
+    col1, col2, col3, col4 = st.columns(4)
+
+    # ---- SERP + ChatGPT VISIBILITY ----
+    with col1:
+        if diagnostics["serp_visibility_status"] == "not_visible":
+            st.metric(
+                "ChatGPT Visibility",
+                "Not visible at all",
+                help="Lumio does not appear in Google SERP or ChatGPT-generated answers"
+            )
+        else:
+            st.metric(
+                "ChatGPT Visibility Gap",
+                f"{diagnostics['serp_visibility_gap']:.2f}",
+                help="Difference in brand mentions vs market average"
+            )
+
+    # ---- SERP + ChatGPT SENTIMENT ----
+    with col2:
+        if diagnostics["serp_sentiment_status"] == "not_available":
+            st.metric(
+                "ChatGPT Sentiment",
+                "Sentiment not found",
+                help="Insufficient Lumio mentions to infer sentiment"
+            )
+        else:
+            st.metric(
+                "ChatGPT Sentiment Gap",
+                f"{diagnostics['serp_sentiment_gap']:.2f}",
+                help="Difference in average sentiment vs competitors"
+            )
+
+    # ---- PERPLEXITY VISIBILITY ----
+    with col3:
+        if diagnostics["pplx_visibility_status"] == "not_visible":
+            st.metric(
+                "Perplexity Visibility",
+                "Not visible at all",
+                help="Lumio does not appear in Perplexity expert responses"
+            )
+        else:
+            st.metric(
+                "Perplexity Visibility Gap",
+                f"{diagnostics['pplx_visibility_gap']:.2f}",
+                help="Difference in expert mentions vs competitors"
+            )
+
+    # ---- PERPLEXITY SENTIMENT ----
+    with col4:
+        if diagnostics["pplx_sentiment_status"] == "not_available":
+            st.metric(
+                "Perplexity Sentiment",
+                "Sentiment not found",
+                help="Insufficient expert commentary to infer sentiment"
+            )
+        else:
+            st.metric(
+                "Perplexity Sentiment Gap",
+                f"{diagnostics['pplx_sentiment_gap']:.2f}",
+                help="Difference in expert sentiment vs competitors"
+            )
+
+    # -------------------------------
+    # INTERPRETATION CALLOUT
+    # -------------------------------
+    if (
+        diagnostics["serp_visibility_status"] == "not_visible"
+        and diagnostics["pplx_visibility_status"] == "not_visible"
+    ):
+        st.warning(
+            "⚠️ Lumio is currently **not visible** across both consumer search (SERP/ChatGPT) "
+            "and expert research (Perplexity). Recommendations will prioritize **visibility creation**."
+        )
+
+    elif diagnostics["serp_visibility_status"] == "visible" and diagnostics["pplx_visibility_status"] == "not_visible":
+        st.info(
+            "ℹ️ Lumio is visible in consumer-facing search but underrepresented in expert discourse. "
+            "Recommendations will focus on **credibility, reviews, and expert validation**."
+        )
+
+    # -------------------------------
+    # STRATEGIC RECOMMENDATIONS
+    # -------------------------------
+    with st.spinner("Generating Lumio-specific recommendations..."):
+        recommendations = generate_lumio_recommendations(diagnostics)
+
+    st.markdown(recommendations)
 
 
 # ================== UI ==================
@@ -1075,12 +1256,7 @@ if "results" in st.session_state:
     
         df_serp_matrix = pd.DataFrame(serp_matrix_rows)
     
-        st.dataframe(
-            df_serp_matrix.style.applymap(
-                color_status, subset=EXPANDED_FEATURES
-            ),
-            use_container_width=True
-        )
+        st.dataframe(df_serp_matrix, use_container_width=True)
     
         export_dataframe(df_serp_matrix, "competitive_matrix_serp")
     
@@ -1093,17 +1269,19 @@ if "results" in st.session_state:
     
         with st.spinner("Analyzing Perplexity expert research..."):
             for b in target_brands:
-                pplx_scores = extract_perplex_competitive_insights(b, segment)
+                p_text = res["perplexity"].get(b, {}).get("answer", "")
+
+            if p_text:
+                pplx_scores = extract_perplex_competitive_insights_from_text(b, p_text)
+            else:
+                pplx_scores = {f: "N/A" for f in EXPANDED_FEATURES}
+                
                 pplx_matrix_rows.append({"Brand": b, **pplx_scores})
     
         df_pplx_matrix = pd.DataFrame(pplx_matrix_rows)
     
-        st.dataframe(
-            df_pplx_matrix.style.applymap(
-                color_status, subset=EXPANDED_FEATURES
-            ),
-            use_container_width=True
-        )
+        st.dataframe(df_pplx_matrix, use_container_width=True)
+
     
         export_dataframe(df_pplx_matrix, "competitive_matrix_perplexity")
         
@@ -1134,46 +1312,4 @@ if "results" in st.session_state:
             )
     
     with tab6:
-        st.header("🎯 Strategic Recommendations for Lumio")
-        st.caption("Derived from live market visibility, sentiment signals, and competitor benchmarks.")
-
-        if "Lumio" not in res["serp"] and "Lumio" not in res["perplexity"]:
-            st.warning("Not enough Lumio data available to generate recommendations.")
-        else:
-            diagnostics = build_lumio_diagnostics(res)
-    
-            col1, col2, col3, col4 = st.columns(4)
-    
-            with col1:
-                st.metric(
-                    "ChatGPT Visibility Gap vs Market",
-                    f"{diagnostics['serp_visibility_gap']:.2f}",
-                    delta="Needs improvement" if diagnostics["serp_visibility_gap"] > 0 else "On par"
-                )
-    
-            with col2:
-                st.metric(
-                    "ChatGPT Sentiment Gap vs Market",
-                    f"{diagnostics['serp_sentiment_gap']:.2f}",
-                    delta="Negative perception" if diagnostics["serp_sentiment_gap"] > 0.05 else "Healthy"
-                )
-                
-            with col3:
-                st.metric(
-                    "Perplexity Visibility Gap vs Market",
-                    f"{diagnostics['pplx_visibility_gap']:.2f}",
-                    delta="Needs improvement" if diagnostics["pplx_visibility_gap"] > 0 else "On par"
-                )
-    
-            with col2:
-                st.metric(
-                    "Perplexity Sentiment Gap vs Market",
-                    f"{diagnostics['pplx_sentiment_gap']:.2f}",
-                    delta="Negative perception" if diagnostics["pplx_sentiment_gap"] > 0.05 else "Healthy"
-                )    
-    
-            with st.spinner("Generating Lumio-specific recommendations..."):
-                recs = generate_lumio_recommendations(diagnostics)
-    
-            st.markdown(recs)
-
+        render_tab6_lumio_recommendations(res)
