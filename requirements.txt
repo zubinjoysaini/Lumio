@@ -1,0 +1,25 @@
+# Core App
+streamlit>=1.32.0
+
+# Data handling
+pandas>=2.1.0
+numpy>=1.26.0
+
+# HTTP & env
+requests>=2.31.0
+python-dotenv>=1.0.0
+
+# OpenAI
+openai>=1.6.0
+
+# Sentiment Analysis
+vaderSentiment>=3.3.2
+
+# Visualization
+plotly>=5.18.0
+matplotlib>=3.8.0
+wordcloud>=1.9.3
+pillow>=10.0.0
+
+# Optional (but strongly recommended)
+tqdm>=4.66.0
