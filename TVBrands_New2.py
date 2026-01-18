@@ -1264,25 +1264,24 @@ if "results" in st.session_state:
         # 🟪 PERPLEXITY MATRIX (Expert Consensus)
         # -------------------------------------------------
         st.subheader("🟪 Perplexity Competitive Matrix (Expert Consensus)")
-    
+
         pplx_matrix_rows = []
-    
+        
         with st.spinner("Analyzing Perplexity expert research..."):
             for b in target_brands:
                 p_text = res["perplexity"].get(b, {}).get("answer", "")
-
-            if p_text:
-                pplx_scores = extract_perplex_competitive_insights_from_text(b, p_text)
-            else:
-                pplx_scores = {f: "N/A" for f in EXPANDED_FEATURES}
-                
+        
+                if p_text:
+                    pplx_scores = extract_perplex_competitive_insights_from_text(b, p_text)
+                else:
+                    pplx_scores = {f: "N/A" for f in EXPANDED_FEATURES}
+        
                 pplx_matrix_rows.append({"Brand": b, **pplx_scores})
-    
+        
         df_pplx_matrix = pd.DataFrame(pplx_matrix_rows)
-    
+        
         st.dataframe(df_pplx_matrix, use_container_width=True)
-
-    
+        
         export_dataframe(df_pplx_matrix, "competitive_matrix_perplexity")
         
     with tab5:
