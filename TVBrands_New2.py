@@ -48,6 +48,14 @@ API_COUNTERS = {
 
 HISTORY_FILE = "tv_brand_visibility_history.csv"
 
+CONFIDENCE_ALERT_THRESHOLD = 40
+
+MAX_QUERIES_BY_MODE = {
+    "Fast Preview": 6,
+    "Deep Research": 10
+}
+
+
 # ================== BRAND ALIASES ==================
 BRAND_ALIASES = {
     "Lumio": ["lumio", "lumio tv", "vision 7", "vision 9", "boss processor"],
@@ -67,6 +75,32 @@ EXPANDED_FEATURES = [
     "Boot-up Speed", "UI Fluidity", "On-Device AI", 
     "Gaming Tech (VRR/144Hz)", "Service Reach (India)"
 ]
+
+INTENT_WEIGHTS = {
+    "complaint": 1.5,
+    "comparison": 1.2,
+    "buying": 1.0,
+    "generic": 0.8
+}
+
+def classify_query_intent(query):
+    q = query.lower()
+    if any(k in q for k in ["complaint", "issue", "problem", "worst", "bad", "fault"]):
+        return "complaint"
+    if any(k in q for k in ["vs", "compare", "comparison"]):
+        return "comparison"
+    if any(k in q for k in ["best", "top", "buy", "recommend"]):
+        return "buying"
+    return "generic"
+
+
+def classify_sentiment_bucket(text, weight=1.0):
+    score = sentiment_score(text) * weight
+    if score <= -0.3:
+        return "complaint"
+    if score >= 0.3:
+        return "praise"
+    return "neutral"
 
 # ================== SENTIMENT ==================
 def sentiment_score(text):
@@ -164,49 +198,50 @@ def chatgpt_question_generator(keyword, serp_data):
     )
     return r.choices[0].message.content, links
 
-def perplexity_question_miner(keyword):
-    headers = {
-        "Authorization": f"Bearer {PERPLEXITY_API_KEY}",
-        "Content-Type": "application/json"
-    }
+# def perplexity_question_miner(keyword):
+#     headers = {
+#         "Authorization": f"Bearer {PERPLEXITY_API_KEY}",
+#         "Content-Type": "application/json"
+#     }
 
-    payload = {
-        "model": "sonar",
-        "messages": [
-            {
-                "role": "user",
-                "content": f"List the most common real-world questions Indian consumers ask online when researching about {keyword}?"
-            }
-        ],
-        "return_citations": True
-    }
+#     payload = {
+#         "model": "sonar",
+#         "messages": [
+#             {
+#                 "role": "user",
+#                 "content": f"List the most common real-world questions Indian consumers ask online when researching about {keyword}?"
+#             }
+#         ],
+#         "return_citations": True
+#     }
 
-    try:
-        r = requests.post(
-            "https://api.perplexity.ai/chat/completions",
-            headers=headers,
-            json=payload,
-            timeout=40
-        )
+#     try:
+#         r = requests.post(
+#             "https://api.perplexity.ai/chat/completions",
+#             headers=headers,
+#             json=payload,
+#             timeout=40
+#         )
 
-        # ❗ HARD GUARD 1 — empty or non-JSON response
-        if not r.text or not r.text.strip().startswith("{"):
-            return "Perplexity questions unavailable.", []
+#         # ❗ HARD GUARD 1 — empty or non-JSON response
+#         if not r.text or not r.text.strip().startswith("{"):
+#             return "Perplexity questions unavailable.", []
 
-        data = r.json()
+#         data = r.json()
 
-        questions = data["choices"][0]["message"]["content"]
+#         questions = data["choices"][0]["message"]["content"]
 
-        sources = [
-            c["url"] for c in data.get("citations", [])
-            if isinstance(c, dict) and "url" in c
-        ]
+#         sources = [
+#             c["url"] for c in data.get("citations", [])
+#             if isinstance(c, dict) and "url" in c
+#         ]
 
-        return questions, sources
+#         return questions, sources
 
-    except Exception as e:
-        # ❗ HARD GUARD 2 — never crash Streamlit
-        return f"Perplexity error: {str(e)}", []
+#     except Exception as e:
+#         # ❗ HARD GUARD 2 — never crash Streamlit
+#         return f"Perplexity error: {str(e)}", []
+
 
 
 def perplexity_answer(keyword):
@@ -280,7 +315,10 @@ def extract_mentions(texts):
             for a in aliases:
                 if re.search(rf"\b{re.escape(a)}\b", tl):
                     mentions[brand]["count"] += 1
-                    mentions[brand]["sentences"].append(t)
+                    sentences = re.split(r'[.!?]', t)
+                    for s in sentences:
+                        if re.search(rf"\b{re.escape(a)}\b", s.lower()):
+                            mentions[brand]["sentences"].append(s.strip())
     return mentions
 
 
@@ -366,14 +404,22 @@ def run_perplexity_deep_research(brand, segment):
 
     return combined_answer.strip()    
 
+@st.cache_data(ttl=86400)
+def cached_perplexity_research(brand, segment):
+    return run_perplexity_deep_research(brand, segment)
 
 # ================== LLM-POWERED EXTRACTION OF FEATURES ==================
+@st.cache_data(ttl=86400)
 def extract_competitive_insights(brand, sentences):
     """Refined to specifically target Boot-up Speed and UI performance."""
     if not sentences:
         return {f: "N/A" for f in EXPANDED_FEATURES}
     
-    context = " ".join(sentences)[:4000]
+    clean_sentences = [
+        s if isinstance(s, str) else s[0]
+        for s in sentences
+    ]
+    context = " ".join(clean_sentences)[:4000]
     prompt = f"""
     Analyze the brand '{brand}' for the Indian market in 2026.
     Rate these features: {', '.join(EXPANDED_FEATURES)}.
@@ -397,6 +443,47 @@ def extract_competitive_insights(brand, sentences):
     except:
         return {f: "Error" for f in EXPANDED_FEATURES}
     
+@st.cache_data(ttl=86400)
+def perplexity_query_answer(query):
+    headers = {
+        "Authorization": f"Bearer {PERPLEXITY_API_KEY}",
+        "Content-Type": "application/json"
+    }
+
+    payload = {
+        "model": "sonar",
+        "messages": [{
+            "role": "user",
+            "content": f"""
+Answer this as an Indian TV buying expert in 2026.
+
+Question:
+{query}
+
+Focus on brand-wise strengths, weaknesses, and reliability.
+"""
+        }],
+        "return_citations": True
+    }
+
+    r = requests.post(
+        "https://api.perplexity.ai/chat/completions",
+        headers=headers,
+        json=payload,
+        timeout=40
+    )
+
+    if not r.ok:
+        return "Perplexity unavailable.", []
+
+    data = r.json()
+    answer = data["choices"][0]["message"]["content"]
+    sources = [
+        c["url"] for c in data.get("citations", [])
+        if isinstance(c, dict) and "url" in c
+    ]
+
+    return answer, sources
     
 def extract_perplex_competitive_insights(brand, segment):
     """
@@ -521,6 +608,57 @@ TRUST & SERVICE:
 
     return response.choices[0].message.content
 
+def safe_avg_sentiment(sentences, cap=20):
+    if not sentences:
+        return 0
+
+    total, weight_sum = 0, 0
+
+    for item in sentences[:cap]:
+        if isinstance(item, tuple):
+            s, w = item
+        else:
+            s, w = item, 1.0  # default weight for SERP / ChatGPT
+
+        total += sentiment_score(s) * w
+        weight_sum += w
+
+    return round(total / weight_sum, 3) if weight_sum else 0
+
+def compute_sentiment_index(sentences, cap=30):
+    """
+    Pure sentiment polarity index (-1 to +1)
+    Uses intent weight ONLY as frequency weight, not polarity scaler
+    """
+    if not sentences:
+        return 0.0
+
+    total = 0.0
+    weight_sum = 0.0
+
+    for item in sentences[:cap]:
+        if isinstance(item, tuple):
+            s, w = item
+        else:
+            s, w = item, 1.0
+
+        total += sentiment_score(s)
+        weight_sum += w
+
+    return round(total / weight_sum, 3) if weight_sum else 0.0
+
+
+def compute_risk_index(complaints, praise):
+    """
+    Risk = complaint density
+    Range: 0 (no risk) → 1 (high risk)
+    """
+    total = complaints + praise
+    if total == 0:
+        return 0.0
+
+    return round(complaints / total, 3)
+
 
 def extract_perplex_competitive_insights_from_text(brand, context_text):
     headers = {
@@ -575,13 +713,28 @@ Rules:
 
 
 # ================== UPDATED ANALYSIS LOOP ==================
+
+
 def run_analysis(queries):
     # Initialize the storage dictionaries that were missing
+    progress = st.progress(0)
+    effective_queries = queries[:MAX_QUERIES_BY_MODE[analysis_mode]]
+    total = len(effective_queries)
     serp_results = defaultdict(lambda: {"mentions": 0, "sentences": []})
-    pplx_results = defaultdict(lambda: {"mentions": 0, "sentences": []})
-    answers = []
+    pplx_results = defaultdict(
+        lambda: {
+            "mentions": 0,
+            "sentences": [],
+            "complaints": 0,
+            "praise": 0
+        }
+    )
 
-    for q in queries[:MAX_SERP_QUERIES]:
+    answers = []
+    all_pplx_brands = set()
+    
+
+    for i, q in enumerate(effective_queries):
         # 1. Get SERP Data
         serp_data = serp_search(q["query"])
         
@@ -589,61 +742,101 @@ def run_analysis(queries):
         serp_mentions = extract_mentions([d["text"] for d in serp_data])
         for brand, data in serp_mentions.items():
             serp_results[brand]["mentions"] += data["count"]
-            serp_results[brand]["sentences"].extend(data["sentences"])
+            query_intent = classify_query_intent(q["query"])
+            intent_weight = INTENT_WEIGHTS.get(query_intent, 1.0)
+            
+            for s in data["sentences"]:
+                serp_results[brand]["sentences"].append((s, intent_weight))
+
 
         # 3. Get Questions & Sources
         chatgpt_q, gsrc = chatgpt_question_generator(q["query"], serp_data)
         chatgpt_mentions = extract_mentions([chatgpt_q])
         primary_question = chatgpt_q.strip().split("\n")[0]
-        chatgpt_answer_text = chatgpt_answer_question(
-            primary_question,
-            context=" ".join([d["text"] for d in serp_data[:3]])
-        )
-        for brand, data in chatgpt_mentions.items():
-            serp_results[brand]["mentions"] += data["count"]
-            serp_results[brand]["sentences"].extend(data["sentences"])       
-    
+        if analysis_mode != "Fast Preview":
+            chatgpt_answer_text = chatgpt_answer_question(
+                primary_question,
+                context=" ".join([d["text"] for d in serp_data[:3]])
+            )
+        else:
+            chatgpt_answer_text = "Skipped in Fast Preview"
+      
+                    
+        if PERPLEXITY_API_KEY:
+            # ✅ Always run ONE Perplexity call (even in Fast Preview)
+            pplx_answer, pplx_answer_sources = perplexity_query_answer(q["query"])
+            pplx_questions = q["query"]
+        
+            query_intent = classify_query_intent(q["query"])
+            intent_weight = INTENT_WEIGHTS.get(query_intent, 1.0)
+        
+            pplx_question_sources = []
+        else:
+            pplx_answer = "Perplexity disabled."
+            pplx_answer_sources = []
+            pplx_questions = "Perplexity disabled."
+            pplx_question_sources = []
 
+    
         # 4. Simple logic to find "Top Brands" for this specific query
         # We sort brands found in this specific search by mention count
         sorted_serp = sorted(serp_mentions.items(), key=lambda x: x[1]["count"], reverse=True)
         top_serp = [b[0] for b in sorted_serp[:3]]
-        
+              
         if not PERPLEXITY_API_KEY:
             pplx_answer = "Perplexity disabled."
             pplx_questions = "Perplexity disabled."
-            pplx_sources = []
+            pplx_answer_sources = []
+            pplx_question_sources = []
             pplx_mentions = {}
         else:
-            pplx_answer, pplx_answer_sources = perplexity_answer(q["query"])
-            pplx_questions, pplx_question_sources = perplexity_question_miner(q["query"])
-            pplx_sources = pplx_answer_sources
             pplx_mentions = extract_mentions([pplx_answer])
+
+            # 🔧 Fallback: if no brands detected, assume answer applies to top SERP brands
+            if not pplx_mentions:
+                pplx_mentions = {}
             
-            
-        # 1️⃣ Aggregate basic Perplexity signals
+
+        # 1️⃣ Aggregate basic Perplexity signals (mentions-based)
         for brand, data in pplx_mentions.items():
             pplx_results[brand]["mentions"] += data["count"]
-            pplx_results[brand]["sentences"].extend(data["sentences"])
+            for s in data["sentences"]:
+                pplx_results[brand]["sentences"].append((s, intent_weight))
+                bucket = classify_sentiment_bucket(s, intent_weight)
+                if bucket == "complaint":
+                    pplx_results[brand]["complaints"] += 1
+                elif bucket == "praise":
+                    pplx_results[brand]["praise"] += 1
         
-        # 2️⃣ Decide Top-3 Perplexity brands for THIS query
+
+        # 2️⃣ Define top Perplexity brands for THIS query
         sorted_pplx = sorted(
             pplx_mentions.items(),
             key=lambda x: x[1]["count"],
             reverse=True
         )
         top_pplx = [b[0] for b in sorted_pplx[:3]]
+        all_pplx_brands.update(top_pplx)
         
-        # 3️⃣ Run deep research ONLY for Top-3 brands
-        for brand in top_pplx:
-            if brand not in PERPLEXITY_DEEP_CACHE:
-                PERPLEXITY_DEEP_CACHE[brand] = run_perplexity_deep_research(
-                    brand, segment
-                )[:4000]
+        # 3️⃣ Accumulate Perplexity answer text (skip only placeholder text)
+        if pplx_answer and "Skipped in Fast Preview" not in pplx_answer:
+            for brand in pplx_mentions.keys():
+                existing_answer = pplx_results[brand].get("answer", "")
+                pplx_results[brand]["answer"] = (
+                    existing_answer + " " + pplx_answer
+                ).strip()
+        # 🔥 Early exit if Lumio signal stabilizes
+        if i >= 4:
+            top_serp_brands = sorted(
+                serp_results.items(),
+                key=lambda x: x[1]["mentions"],
+                reverse=True
+            )[:5]
         
-            pplx_results[brand]["answer"] = PERPLEXITY_DEEP_CACHE[brand]
+            if "Lumio" in [b[0] for b in top_serp_brands]:
+                break
+                
 
-        
         answers.append({
             "keyword": q["query"],
         
@@ -661,14 +854,32 @@ def run_analysis(queries):
             "top_brands_serp": top_serp,
             "top_brands_pplx": top_pplx
         })
+        
+        progress.progress(int((i + 1) / total * 100))
+        
+        # 🔥 Run Perplexity deep research ONCE per brand (hard capped)
+        # 🔥 Optional Perplexity deep research (Deep mode only)
+        if analysis_mode == "Deep Research" and i >= 3:
+            for brand in list(all_pplx_brands - PERPLEXITY_DEEP_CACHE.keys())[:2]:
+                if brand not in PERPLEXITY_DEEP_CACHE:
+                    PERPLEXITY_DEEP_CACHE[brand] = cached_perplexity_research(
+                        brand, segment
+                    )[:4000]
+        
+                existing = pplx_results[brand].get("answer", "")
+                pplx_results[brand]["answer"] = (
+                    existing + " " + PERPLEXITY_DEEP_CACHE[brand]
+                ).strip()
 
 
+    progress.empty()   
     # CRITICAL: Return must be OUTSIDE the for loop
     return {
         "serp": dict(serp_results),
         "perplexity": dict(pplx_results),
         "answers": answers,
         "timestamp": datetime.now().strftime("%Y-%W")
+
     }
 
 
@@ -681,11 +892,7 @@ def persist_weekly_snapshot(res):
             "Source": "SERP+ChatGPT",
             "Brand": brand,
             "Visibility": data.get("mentions", 0),
-            "Sentiment": round(
-                sum(sentiment_score(s) for s in data.get("sentences", [])) /
-                len(data.get("sentences", [])),
-                3
-            ) if data.get("sentences") else 0
+            "Sentiment": safe_avg_sentiment(data.get("sentences", []))
         })
 
     for brand, data in res["perplexity"].items():
@@ -694,17 +901,21 @@ def persist_weekly_snapshot(res):
             "Source": "Perplexity",
             "Brand": brand,
             "Visibility": data.get("mentions", 0),
-            "Sentiment": round(
-                sum(sentiment_score(s) for s in data.get("sentences", [])) /
-                len(data.get("sentences", [])),
-                3
-            ) if data.get("sentences") else 0
+            "Sentiment": safe_avg_sentiment(data.get("sentences", []))
         })
 
     df = pd.DataFrame(rows)
 
     if os.path.exists(HISTORY_FILE):
-        df.to_csv(HISTORY_FILE, mode="a", header=False, index=False)
+        existing = load_history()
+        combined = pd.concat([existing, df], ignore_index=True)
+        combined.drop_duplicates(
+            subset=["Week", "Source", "Brand"],
+            keep="last",
+            inplace=True
+        )
+        combined.to_csv(HISTORY_FILE, index=False)
+
     else:
         df.to_csv(HISTORY_FILE, index=False)
         
@@ -714,14 +925,8 @@ def load_history():
     return pd.read_csv(HISTORY_FILE)     
 
 def compute_weekly_delta(history_df, current_week):
-    prev_week = (
-        history_df["Week"]
-        .drop_duplicates()
-        .sort_values()
-        .iloc[-2]
-        if history_df["Week"].nunique() > 1
-        else None
-    )
+    weeks = sorted(history_df["Week"].unique())
+    prev_week = weeks[-2] if len(weeks) >= 2 else None
 
     if not prev_week:
         return pd.DataFrame()
@@ -739,24 +944,65 @@ def compute_weekly_delta(history_df, current_week):
     merged["Sentiment Δ"] = merged["Sentiment_curr"] - merged["Sentiment_prev"]
 
     return merged    
+
         
 # ================== DATAFRAME ==================
-def to_df(data):
-    df = pd.DataFrame(columns=["Brand", "Visibility", "Sentiment"])
+def to_df(data, source_count=1):
+    df = pd.DataFrame(columns=[
+        "Brand",
+        "Visibility",
+        "Sentiment Index",
+        "Risk Index",
+        "Confidence"
+    ])
+
     if not data:
         return df
 
     rows = []
     for b, d in data.items():
+        visibility = d.get("mentions", 0)
+        sentences = d.get("sentences", [])
+
+        complaints = d.get("complaints", 0)
+        praise = d.get("praise", 0)
+
         rows.append({
             "Brand": b,
-            "Visibility": d.get("mentions", 0),
-            "Sentiment": round(
-                sum(sentiment_score(s) for s in d.get("sentences", [])) / len(d.get("sentences", [])),
-                3
-            ) if d.get("sentences") else 0
+            "Visibility": visibility,
+            "Sentiment Index": compute_sentiment_index(sentences),
+            "Risk Index": compute_risk_index(complaints, praise),
+            "Confidence": compute_confidence(
+                visibility,
+                len(sentences),
+                source_count
+            )
         })
-    return pd.DataFrame(rows, columns=["Brand", "Visibility", "Sentiment"])
+
+    return pd.DataFrame(rows)
+
+def compute_confidence(visibility, sentence_count, source_count):
+    """
+    Confidence heuristic:
+    - Visibility weight
+    - Sample size weight
+    - Multi-source bonus
+    """
+    score = 0
+
+    score += min(visibility * 5, 40)
+    score += min(sentence_count * 2, 40)
+    score += 20 if source_count > 1 else 0
+
+    return min(score, 100)
+
+def confidence_label(score):
+    if score >= 70:
+        return "High"
+    elif score >= 40:
+        return "Medium"
+    return "Low"
+
 
 def build_lumio_diagnostics(res):
     serp_df = to_df(res["serp"])
@@ -767,8 +1013,13 @@ def build_lumio_diagnostics(res):
 
     competitors_serp = serp_df[serp_df["Brand"] != "Lumio"]
     competitors_pplx = pplx_df[pplx_df["Brand"] != "Lumio"]
+    
 
     diagnostics = {}
+    
+    diagnostics["lumio_complaints"] = res["perplexity"].get("Lumio", {}).get("complaints", 0)
+    diagnostics["lumio_praise"] = res["perplexity"].get("Lumio", {}).get("praise", 0)
+
 
     # --- SERP VISIBILITY ---
     if lumio_serp.empty and not competitors_serp.empty:
@@ -821,7 +1072,10 @@ def build_lumio_diagnostics(res):
         res["perplexity"].get("Lumio", {}).get("sentences", [])
     )
 
-    diagnostics["lumio_sentences"] = lumio_sentences[:50]
+    diagnostics["lumio_sentences"] = [
+        s if isinstance(s, str) else s[0]
+        for s in lumio_sentences[:50]
+    ]
 
     # Top competing brands
     diagnostics["top_competitors"] = (
@@ -832,18 +1086,68 @@ def build_lumio_diagnostics(res):
         if not competitors_serp.empty
         else []
     )
+    
+    if not lumio_serp.empty and not lumio_pplx.empty:
+        diagnostics["confidence_note"] = "High confidence (multi-source validation)"
+    else:
+        diagnostics["confidence_note"] = "Low confidence (limited visibility)"
+    # -------------------------------
+    # CONFIDENCE ALERT LOGIC
+    # -------------------------------
+    lumio_visibility = (
+        serp_df[serp_df["Brand"] == "Lumio"]["Visibility"].sum()
+        if not serp_df.empty else 0
+    )
+    
+    lumio_sentence_count = (
+        len(res["serp"].get("Lumio", {}).get("sentences", [])) +
+        len(res["perplexity"].get("Lumio", {}).get("sentences", []))
+    )
 
+    
+    diagnostics["lumio_confidence_score"] = compute_confidence(
+        lumio_visibility,
+        lumio_sentence_count,
+        2 if diagnostics["pplx_visibility_status"] == "visible" else 1
+    )
+    
+    diagnostics["low_confidence"] = (
+        diagnostics["lumio_confidence_score"] < CONFIDENCE_ALERT_THRESHOLD
+    )    
+    
     return diagnostics
 
 
 # ================== WORD CLOUD ==================
 def render_wordcloud(sentences):
-    text = " ".join(sentences)
+    text = " ".join([
+        s if isinstance(s, str) else s[0]
+        for s in sentences
+    ])
     wc = WordCloud(width=800, height=400, background_color="white").generate(text)
     fig, ax = plt.subplots()
     ax.imshow(wc)
     ax.axis("off")
     st.pyplot(fig)
+    
+def render_brand_wordcloud(res, brand, source="Both"):
+    sentences = []
+
+    if source in ("SERP", "Both"):
+        sentences.extend(
+            res["serp"].get(brand, {}).get("sentences", [])
+        )
+
+    if source in ("Perplexity", "Both"):
+        sentences.extend(
+            res["perplexity"].get(brand, {}).get("sentences", [])
+        )
+
+    if not sentences:
+        st.info(f"No sentences available for {brand} ({source}).")
+        return
+
+    render_wordcloud(sentences)    
 
 
 # ================== DATA PROCESSING FOR MATRIX ==================
@@ -863,7 +1167,7 @@ def prepare_matrix_dfs(target_brands, res):
 
         # Only extract if deep Perplexity research exists
         if p_text:
-            p_scores = extract_perplex_competitive_insights(b, p_text)
+            p_scores = extract_perplex_competitive_insights_from_text(b, p_text)
         else:
             p_scores = {f: "N/A" for f in EXPANDED_FEATURES}
         
@@ -902,13 +1206,24 @@ def color_status(val):
     return ""
 
 def render_tab6_lumio_recommendations(res):
+    diagnostics = build_lumio_diagnostics(res)
     st.header("🎯 Strategic Recommendations for Lumio")
+    st.metric("Lumio Complaints", diagnostics["lumio_complaints"])
+    st.metric("Lumio Praise", diagnostics["lumio_praise"])
+
     st.caption(
         "Derived from market visibility (SERP + ChatGPT), expert consensus (Perplexity), "
         "and comparative sentiment signals."
     )
+    st.caption(f"📊 Confidence Assessment: **{diagnostics.get('confidence_note','N/A')}**")
+    if diagnostics.get("low_confidence"):
+        st.warning(
+            "⚠️ **Low Confidence Alert**: Lumio has insufficient visibility and/or sentiment data. "
+            "Insights below may be directional only. Primary recommendation is to **increase visibility** "
+            "across search and expert platforms."
+        )
 
-    diagnostics = build_lumio_diagnostics(res)
+    
 
     # -------------------------------
     # VISIBILITY & SENTIMENT METRICS
@@ -997,7 +1312,12 @@ def render_tab6_lumio_recommendations(res):
     # STRATEGIC RECOMMENDATIONS
     # -------------------------------
     with st.spinner("Generating Lumio-specific recommendations..."):
+        if diagnostics.get("low_confidence"):
+            st.info(
+                "📌 Recommendations are **visibility-first** due to limited signal strength."
+            )
         recommendations = generate_lumio_recommendations(diagnostics)
+
 
     st.markdown(recommendations)
 
@@ -1010,6 +1330,13 @@ segment = st.sidebar.selectbox(
     "Price Segment",
     ["All", "Budget", "Mid", "Premium"]
 )
+
+analysis_mode = st.sidebar.radio(
+    "Analysis Mode",
+    ["Fast Preview", "Deep Research"],
+    help="Fast Preview skips Perplexity deep research for speed"
+)
+
 
 
 # =============================================================================
@@ -1101,7 +1428,7 @@ if "results" in st.session_state:
     with col1:
         st.subheader("Google SERP + ChatGPT")
 
-        df_serp = to_df(res["serp"])
+        df_serp = to_df(res["serp"], source_count = 1)
         if df_serp.empty:
             st.warning("No SERP/ChatGPT brand mentions found.")
         else:
@@ -1113,20 +1440,20 @@ if "results" in st.session_state:
             )
             fig_serp.add_scatter(
                 x=df_serp["Brand"],
-                y=df_serp["Sentiment"],
+                y=df_serp["Sentiment Index"],
                 secondary_y=True,
                 mode="lines+markers",
-                name="Sentiment"
+                name="Sentiment Index"
             )
             fig_serp.update_layout(title="SERP + ChatGPT")
             st.plotly_chart(fig_serp, use_container_width=True)
             
-
+    
     # ---- Perplexity ----
     with col2:
         st.subheader("Perplexity AI")
 
-        df_pplx = to_df(res["perplexity"])
+        df_pplx = to_df(res["perplexity"], source_count = 2)
         if df_pplx.empty:
             st.warning("No Perplexity brand mentions found.")
         else:
@@ -1138,10 +1465,10 @@ if "results" in st.session_state:
             )
             fig_pplx.add_scatter(
                 x=df_pplx["Brand"],
-                y=df_pplx["Sentiment"],
+                y=df_pplx["Sentiment Index"],
                 secondary_y=True,
                 mode="lines+markers",
-                name="Sentiment"
+                name="Sentiment Index"
             )
             fig_pplx.update_layout(title="Perplexity")
             st.plotly_chart(fig_pplx, use_container_width=True)
@@ -1150,7 +1477,18 @@ if "results" in st.session_state:
 
             export_dataframe(df_serp, "serp_visibility")
             export_dataframe(df_pplx, "perplexity_visibility")
+    st.subheader("⚠️ Brand Risk Index")
 
+    risk_df = df_pplx[["Brand", "Risk Index"]].sort_values(
+        "Risk Index", ascending=False
+    )
+    
+    st.dataframe(
+        risk_df.style.format({"Risk Index": "{:.2f}"})
+                 .background_gradient(cmap="Reds"),
+        use_container_width=True
+    )
+   
     if "results" in st.session_state:
         res = st.session_state.results
         
@@ -1189,8 +1527,71 @@ if "results" in st.session_state:
                         st.caption("**Sources (Perplexity):**")
                         for i, link in enumerate(a["perplexity_sources"], 1):
                             st.markdown(f"{i}. 🔗 [{link}]({link})")
+        
+        st.subheader("☁️ Voice of Customer – Word Cloud")
+
+        col1, col2 = st.columns(2)
+        
+        # --- SERP / ChatGPT Word Cloud ---
+        with col1:
+            st.markdown("**Google SERP + ChatGPT**")
+            serp_sentences_all = []
+            for v in res["serp"].values():
+                serp_sentences_all.extend(v.get("sentences", []))
+        
+            if serp_sentences_all:
+                render_wordcloud(serp_sentences_all)
+            else:
+                st.info("No SERP sentences available for word cloud.")
+        
+        # --- Perplexity Word Cloud ---
+        with col2:
+            st.markdown("**Perplexity (Expert Voice)**")
+            pplx_sentences_all = []
+            for v in res["perplexity"].values():
+                pplx_sentences_all.extend(v.get("sentences", []))
+        
+            if pplx_sentences_all:
+                render_wordcloud(pplx_sentences_all)
+            else:
+                st.info("No Perplexity sentences available for word cloud.")
                         
-                        
+        st.header("☁️ Brand-specific Voice of Customer")
+
+        # Collect all brands dynamically
+        available_brands = sorted(
+            set(list(res["serp"].keys()) + list(res["perplexity"].keys()))
+        )
+        
+        if not available_brands:
+            st.info("No brands available for word cloud.")
+        else:
+            col1, col2, col3 = st.columns([2, 2, 4])
+        
+            with col1:
+                selected_brand = st.selectbox(
+                    "Select Brand",
+                    available_brands,
+                    index=available_brands.index("Lumio") if "Lumio" in available_brands else 0
+                )
+        
+            with col2:
+                selected_source = st.selectbox(
+                    "Source",
+                    ["Both", "SERP", "Perplexity"]
+                )
+        
+            with col3:
+                st.caption(
+                    "Word cloud generated from actual sentences where the selected brand "
+                    "is mentioned. Reflects consumer (SERP/ChatGPT) and/or expert (Perplexity) language."
+                )
+        
+            render_brand_wordcloud(
+                res,
+                brand=selected_brand,
+                source=selected_source
+            )                
         qa_export_df = pd.DataFrame([
         {
             "Keyword": a["keyword"],
@@ -1231,6 +1632,11 @@ if "results" in st.session_state:
             "Two independent perspectives: "
             "Market perception (SERP + ChatGPT) vs Expert consensus (Perplexity)."
         )
+        st.caption(
+            "⚠ Brands with **Low Confidence** have insufficient visibility or evidence. "
+            "Comparisons should be treated as directional, not definitive."
+        )
+
     
         # -------------------------------------------------
         # Identify brands to compare
@@ -1252,9 +1658,26 @@ if "results" in st.session_state:
             for b in target_brands:
                 serp_sentences = res["serp"].get(b, {}).get("sentences", [])
                 serp_scores = extract_competitive_insights(b, serp_sentences)
-                serp_matrix_rows.append({"Brand": b, **serp_scores})
+                
+                confidence_score = compute_confidence(
+                    visibility=res["serp"].get(b, {}).get("mentions", 0),
+                    sentence_count=len(serp_sentences),
+                    source_count=1
+                )
+
+                serp_matrix_rows.append({
+                    "Brand": b,
+                    **serp_scores,
+                    "Confidence Score": confidence_score,
+                    "Confidence Level": confidence_label(confidence_score)
+                })
     
         df_serp_matrix = pd.DataFrame(serp_matrix_rows)
+        
+        df_serp_matrix = df_serp_matrix.sort_values(
+            by="Confidence Score", ascending=False
+        )
+
     
         st.dataframe(df_serp_matrix, use_container_width=True)
     
@@ -1269,16 +1692,42 @@ if "results" in st.session_state:
         
         with st.spinner("Analyzing Perplexity expert research..."):
             for b in target_brands:
-                p_text = res["perplexity"].get(b, {}).get("answer", "")
+                p_text = (
+                    res["perplexity"].get(b, {}).get("answer", "")
+                    or " ".join(res["perplexity"].get(b, {}).get("sentences", []))
+                )
+
         
                 if p_text:
-                    pplx_scores = extract_perplex_competitive_insights_from_text(b, p_text)
+                    if p_text and len(p_text.split()) > 40:
+                        pplx_scores = extract_perplex_competitive_insights_from_text(b, p_text)
+                    else:
+                        pplx_scores = {f: "Unknown" for f in EXPANDED_FEATURES}
+                    sentence_count = len(p_text.split("."))
                 else:
                     pplx_scores = {f: "N/A" for f in EXPANDED_FEATURES}
-        
-                pplx_matrix_rows.append({"Brand": b, **pplx_scores})
+                    sentence_count = 0
+                
+                confidence_score = compute_confidence(
+                    visibility=res["perplexity"].get(b, {}).get("mentions", 0),
+                    sentence_count=sentence_count,
+                    source_count=2
+                )
+
+                pplx_matrix_rows.append({
+                    "Brand": b,
+                    **pplx_scores,
+                    "Confidence Score": confidence_score,
+                    "Confidence Level": confidence_label(confidence_score)
+                })
+
         
         df_pplx_matrix = pd.DataFrame(pplx_matrix_rows)
+        
+        df_pplx_matrix = df_pplx_matrix.sort_values(
+            by="Confidence Score", ascending=False
+        )
+
         
         st.dataframe(df_pplx_matrix, use_container_width=True)
         
